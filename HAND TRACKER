@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Laser Cat's Cradle — Hand Tracking</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background: #000;
+    width: 100%;
+    height: 100%;
+    font-family: 'Courier New', monospace;
+  }
+  #overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    z-index: 10;
+    text-align: center;
+    color: #0ff;
+    padding: 14px;
+    text-shadow: 0 0 8px #0ff, 0 0 16px #0ff;
+    pointer-events: none;
+    letter-spacing: 1px;
+  }
+  #loading {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    color: #0ff;
+    font-size: 20px;
+    text-shadow: 0 0 10px #0ff;
+    z-index: 20;
+    text-align: center;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="loading">INITIALIZING HAND TRACKING SYSTEM...<br><span style="font-size:12px; opacity:0.7;">Allow camera access to continue</span></div>
+<div id="overlay">
+  <div style="font-size:16px;">⚡ LASER CAT'S CRADLE ⚡</div>
+  <div style="font-size:11px; opacity:0.75;">Touch fingertips of both hands together for a particle burst</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.js"></script>
+
+<script>
+// ---------------------------------------------------------------
+// GLOBAL STATE
+// ---------------------------------------------------------------
+let capture;               // p5 video capture
+let handsModel;            // MediaPipe Hands instance
+let latestResults = null;  // most recent detection results
+let frameLoopRunning = false;
+let particles = [];        // active particle systems
+let ready = false;
+
+// Fingertip landmark indices in MediaPipe's 21-point hand model
+const FINGERTIPS = [4, 8, 12, 16, 20];
+// Full connection map so we can draw a light skeleton on each hand
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],           // thumb
+  [0,5],[5,6],[6,7],[7,8],           // index
+  [5,9],[9,10],[10,11],[11,12],      // middle
+  [9,13],[13,14],[14,15],[15,16],    // ring
+  [13,17],[17,18],[18,19],[19,20],   // pinky
+  [0,17]
+];
+
+// Distance (in pixels) below which two paired fingertips count as "touching"
+const TOUCH_THRESHOLD = 42;
+// Track touch state per finger pair so we only fire one burst per contact
+const touchState = [false, false, false, false, false];
+
+// Color palette cycling through cyan / magenta / yellow
+function laserColor(t, alpha) {
+  // t in [0,1], cycles hue across cyan(180) -> magenta(300) -> yellow(55)
+  const stops = [180, 300, 55, 180];
+  const seg = t * (stops.length - 1);
+  const i = Math.floor(seg);
+  const f = seg - i;
+  const hue = lerp(stops[i], stops[i+1], f);
+  return `hsla(${hue}, 100%, 60%, ${alpha})`;
+}
+
+// ---------------------------------------------------------------
+// MEDIAPIPE SETUP
+// ---------------------------------------------------------------
+function onHandsResults(results) {
+  latestResults = results;
+  if (!ready) {
+    ready = true;
+    document.getElementById('loading').style.display = 'none';
+  }
+}
+
+async function initMediaPipe() {
+  handsModel = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+  handsModel.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.6
+  });
+  handsModel.onResults(onHandsResults);
+
+  // NOTE: we deliberately do NOT use MediaPipe's own `Camera` helper here.
+  // That helper calls getUserMedia() itself, which would request the webcam
+  // a second time on top of p5's createCapture() and can fail with
+  // "NotReadableError: Could not start video source" on many systems.
+  // Instead we just keep feeding the existing p5 video element to the model.
+  frameLoopRunning = true;
+  sendFrameLoop();
+}
+
+async function sendFrameLoop() {
+  if (!frameLoopRunning) return;
+  const vid = capture.elt;
+  if (vid && vid.readyState >= 2 && vid.videoWidth > 0) {
+    try {
+      await handsModel.send({ image: vid });
+    } catch (e) {
+      console.error('Hands.send error:', e);
+    }
+  }
+  requestAnimationFrame(sendFrameLoop);
+}
+
+// ---------------------------------------------------------------
+// P5 LIFECYCLE
+// ---------------------------------------------------------------
+function setup() {
+  const cnv = createCanvas(windowWidth, windowHeight);
+  cnv.style('position', 'fixed');
+  cnv.style('top', '0');
+  cnv.style('left', '0');
+  pixelDensity(1);
+  colorMode(HSB, 360, 100, 100, 1);
+
+  capture = createCapture({ video: { facingMode: 'user' }, audio: false }, () => {
+    initMediaPipe();
+  });
+  capture.size(640, 480);
+  capture.hide();
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+
+function draw() {
+  background(220, 85, 45); // solid blue fills everything outside the framed border
+
+  drawMirroredVideo();
+  drawScanlineVignette();
+
+  if (latestResults && latestResults.multiHandLandmarks && latestResults.multiHandLandmarks.length > 0) {
+    const handList = latestResults.multiHandLandmarks;
+
+    // Draw glowing joints + skeleton for every detected hand
+    for (let h = 0; h < handList.length; h++) {
+      drawHandGlow(handList[h], h);
+    }
+
+    // If both hands are visible, draw laser strings between corresponding fingertips
+    if (handList.length === 2) {
+      drawLaserStrings(handList[0], handList[1]);
+    } else {
+      // reset touch state if a hand drops out
+      for (let i = 0; i < touchState.length; i++) touchState[i] = false;
+    }
+  }
+
+  updateAndDrawParticles();
+  drawProfessionalFrame();
+}
+
+// ---------------------------------------------------------------
+// PROFESSIONAL CAMERA FRAME (viewfinder HUD overlay)
+// ---------------------------------------------------------------
+function drawProfessionalFrame() {
+  const ctx = drawingContext;
+  const { x, y, w, h } = getFrameRect();
+  const bracketLen = Math.min(w, h) * 0.06;
+  const hue = 190; // cyan HUD color
+
+  ctx.save();
+
+  // Fill everything outside the frame with a deep black-blue background
+  ctx.fillStyle = 'rgb(3, 6, 16)';
+  ctx.fillRect(0, 0, width, y);                 // top strip
+  ctx.fillRect(0, y + h, width, height - (y + h)); // bottom strip
+  ctx.fillRect(0, y, x, h);                      // left strip
+  ctx.fillRect(x + w, y, width - (x + w), h);    // right strip
+
+  // Faint rule-of-thirds guide lines
+  ctx.strokeStyle = `hsla(${hue}, 100%, 70%, 0.15)`;
+  ctx.lineWidth = 1;
+  for (let i = 1; i <= 2; i++) {
+    ctx.beginPath();
+    ctx.moveTo(x + (w / 3) * i, y);
+    ctx.lineTo(x + (w / 3) * i, y + h);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x, y + (h / 3) * i);
+    ctx.lineTo(x + w, y + (h / 3) * i);
+    ctx.stroke();
+  }
+
+  // Thin glowing full border
+  ctx.shadowBlur = 12;
+  ctx.shadowColor = `hsla(${hue}, 100%, 60%, 0.8)`;
+  ctx.strokeStyle = `hsla(${hue}, 100%, 65%, 0.55)`;
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(x, y, w, h);
+
+  // Bright corner brackets, like a camera viewfinder
+  ctx.shadowBlur = 16;
+  ctx.strokeStyle = `hsla(${hue}, 100%, 70%, 0.95)`;
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  const corners = [
+    [[x, y + bracketLen], [x, y], [x + bracketLen, y]],                     // top-left
+    [[x + w - bracketLen, y], [x + w, y], [x + w, y + bracketLen]],         // top-right
+    [[x, y + h - bracketLen], [x, y + h], [x + bracketLen, y + h]],         // bottom-left
+    [[x + w - bracketLen, y + h], [x + w, y + h], [x + w, y + h - bracketLen]] // bottom-right
+  ];
+  for (const pts of corners) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    ctx.lineTo(pts[1][0], pts[1][1]);
+    ctx.lineTo(pts[2][0], pts[2][1]);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+
+  // REC indicator + timecode, top-left of the frame
+  const blink = (millis() % 1000) < 550;
+  const padX = x + 16, padY = y + 24;
+  ctx.font = '13px "Courier New", monospace';
+  ctx.textBaseline = 'middle';
+
+  if (blink) {
+    ctx.fillStyle = 'rgba(255,60,60,0.95)';
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = 'rgba(255,60,60,0.9)';
+    ctx.beginPath();
+    ctx.arc(padX, padY, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillText('REC', padX + 12, padY);
+
+  const totalSec = Math.floor(millis() / 1000);
+  const mm = String(Math.floor(totalSec / 60)).padStart(2, '0');
+  const ss = String(totalSec % 60).padStart(2, '0');
+  ctx.fillStyle = `hsla(${hue}, 100%, 80%, 0.85)`;
+  ctx.textAlign = 'right';
+  ctx.fillText(`${mm}:${ss}  •  1080p  •  LIVE`, x + w - 16, padY);
+  ctx.textAlign = 'left';
+
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------
+// VIDEO BACKGROUND
+// ---------------------------------------------------------------
+function getFrameRect() {
+  const margin = Math.min(width, height) * 0.035;
+  return {
+    x: margin,
+    y: margin,
+    w: width - margin * 2,
+    h: height - margin * 2
+  };
+}
+
+function drawMirroredVideo() {
+  const ctx = drawingContext;
+  const { x, y, w, h } = getFrameRect();
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip(); // only show the video inside the frame; outside stays blue
+
+  push();
+  translate(width, 0);
+  scale(-1, 1);
+  noTint(); // full brightness, no darkening
+  image(capture, 0, 0, width, height);
+  pop();
+
+  ctx.restore();
+}
+
+function drawScanlineVignette() {
+  // no-op: vignette removed so the camera feed stays fully visible
+}
+
+// ---------------------------------------------------------------
+// COORDINATE HELPER (mirror the normalized landmark into canvas space)
+// ---------------------------------------------------------------
+function toScreen(landmark) {
+  return {
+    x: width - landmark.x * width,
+    y: landmark.y * height
+  };
+}
+
+// ---------------------------------------------------------------
+// HAND GLOW (joints + skeleton)
+// ---------------------------------------------------------------
+function drawHandGlow(landmarks, handIndex) {
+  const ctx = drawingContext;
+  const baseHue = handIndex === 0 ? 190 : 300; // cyan-ish vs magenta-ish per hand
+
+  // Skeleton lines (thin, soft glow)
+  ctx.save();
+  ctx.shadowBlur = 12;
+  ctx.shadowColor = `hsla(${baseHue}, 100%, 60%, 0.9)`;
+  ctx.strokeStyle = `hsla(${baseHue}, 100%, 70%, 0.5)`;
+  ctx.lineWidth = 2;
+  for (const [a, b] of HAND_CONNECTIONS) {
+    const pa = toScreen(landmarks[a]);
+    const pb = toScreen(landmarks[b]);
+    ctx.beginPath();
+    ctx.moveTo(pa.x, pa.y);
+    ctx.lineTo(pb.x, pb.y);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // Joint dots
+  for (let i = 0; i < landmarks.length; i++) {
+    const p = toScreen(landmarks[i]);
+    const isTip = FINGERTIPS.includes(i);
+    const r = isTip ? 7 : 4;
+    const hue = isTip ? (baseHue + 40) % 360 : baseHue;
+
+    ctx.save();
+    ctx.shadowBlur = isTip ? 22 : 10;
+    ctx.shadowColor = `hsla(${hue}, 100%, 65%, 1)`;
+    ctx.fillStyle = `hsla(${hue}, 100%, 75%, 0.95)`;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ---------------------------------------------------------------
+// LASER STRINGS between corresponding fingertips of the two hands
+// ---------------------------------------------------------------
+function drawLaserStrings(handA, handB) {
+  const t = millis() * 0.001;
+
+  for (let i = 0; i < FINGERTIPS.length; i++) {
+    const idx = FINGERTIPS[i];
+    const pA = toScreen(handA[idx]);
+    const pB = toScreen(handB[idx]);
+
+    const dist = Math.hypot(pB.x - pA.x, pB.y - pA.y);
+    const maxSpan = Math.max(width, height);
+
+    // Elastic tension mapping: closer = thick & bright, stretched = thin & taut
+    const tension = constrain(map(dist, 40, maxSpan * 0.6, 0, 1), 0, 1);
+    const coreWidth = lerp(9, 2, tension);
+    const glowWidth = coreWidth * 3.2;
+    const alpha = lerp(1, 0.35, tension);
+
+    // Slight elastic sag/wobble perpendicular to the line, eased by tension
+    const midX = (pA.x + pB.x) / 2;
+    const midY = (pA.y + pB.y) / 2;
+    const dx = pB.x - pA.x, dy = pB.y - pA.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len;
+    const wobble = Math.sin(t * 6 + i * 1.7) * (10 * (1 - tension) + 2);
+    const ctrlX = midX + nx * wobble;
+    const ctrlY = midY + ny * wobble;
+
+    const colorT = ((i / FINGERTIPS.length) + t * 0.08) % 1;
+    const col = laserColor(colorT, alpha);
+
+    const ctx = drawingContext;
+    ctx.save();
+
+    // Pass 1: broad soft glow
+    ctx.shadowBlur = 35;
+    ctx.shadowColor = col;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = glowWidth;
+    ctx.lineCap = 'round';
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    ctx.moveTo(pA.x, pA.y);
+    ctx.quadraticCurveTo(ctrlX, ctrlY, pB.x, pB.y);
+    ctx.stroke();
+
+    // Pass 2: bright hot core beam
+    ctx.shadowBlur = 18;
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = `hsla(0, 0%, 100%, ${alpha})`;
+    ctx.lineWidth = Math.max(1.5, coreWidth * 0.35);
+    ctx.beginPath();
+    ctx.moveTo(pA.x, pA.y);
+    ctx.quadraticCurveTo(ctrlX, ctrlY, pB.x, pB.y);
+    ctx.stroke();
+
+    ctx.restore();
+
+    // Touch detection -> particle burst
+    if (dist < TOUCH_THRESHOLD) {
+      if (!touchState[i]) {
+        touchState[i] = true;
+        spawnBurst(midX, midY, colorT);
+      }
+    } else {
+      touchState[i] = false;
+    }
+  }
+}
+
+// ---------------------------------------------------------------
+// PARTICLE SYSTEM
+// ---------------------------------------------------------------
+function spawnBurst(x, y, colorT) {
+  const count = 45;
+  for (let i = 0; i < count; i++) {
+    const angle = random(TWO_PI);
+    const speed = random(2, 9);
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 1,
+      decay: random(0.015, 0.035),
+      size: random(2, 5),
+      hueT: (colorT + random(-0.08, 0.08) + 1) % 1
+    });
+  }
+  // A quick bright flash ring
+  particles.push({
+    x, y, vx: 0, vy: 0,
+    life: 1, decay: 0.06,
+    size: 6, ring: true, maxRing: 90,
+    hueT: colorT
+  });
+}
+
+function updateAndDrawParticles() {
+  const ctx = drawingContext;
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= p.decay;
+    if (p.life <= 0) {
+      particles.splice(i, 1);
+      continue;
+    }
+
+    if (p.ring) {
+      const r = lerp(4, p.maxRing, 1 - p.life);
+      ctx.save();
+      ctx.globalAlpha = p.life;
+      ctx.strokeStyle = laserColor(p.hueT, 1);
+      ctx.shadowBlur = 25;
+      ctx.shadowColor = laserColor(p.hueT, 1);
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+      continue;
+    }
+
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vx *= 0.96;
+    p.vy *= 0.96;
+
+    ctx.save();
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = laserColor(p.hueT, 1);
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = laserColor(p.hueT, 1);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+</script>
+</body>
+</html>
